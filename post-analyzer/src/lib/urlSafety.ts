@@ -37,14 +37,36 @@ function isPrivateIPv4(ip: string): boolean {
   return false;
 }
 
+function ipv6MappedIPv4(lower: string): string | null {
+  // Dotted-decimal form: ::ffff:1.2.3.4
+  const dotted = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) return dotted[1];
+  // Hex form: ::ffff:abcd:ef01 (also tolerate ::ffff:0:abcd:ef01)
+  const hex = lower.match(
+    /^(?:::ffff:|::ffff:0:)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/,
+  );
+  if (hex) {
+    const a = parseInt(hex[1], 16);
+    const b = parseInt(hex[2], 16);
+    if (a > 0xffff || b > 0xffff) return null;
+    return [
+      (a >> 8) & 0xff,
+      a & 0xff,
+      (b >> 8) & 0xff,
+      b & 0xff,
+    ].join(".");
+  }
+  return null;
+}
+
 function isPrivateIPv6(ip: string): boolean {
   const lower = ip.toLowerCase();
   if (lower === "::1" || lower === "::") return true;
   if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA
   if (lower.startsWith("fe80:")) return true; // link-local
   if (lower.startsWith("ff")) return true; // multicast
-  const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return isPrivateIPv4(mapped[1]);
+  const mapped = ipv6MappedIPv4(lower);
+  if (mapped) return isPrivateIPv4(mapped);
   return false;
 }
 

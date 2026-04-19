@@ -54,6 +54,9 @@ export async function generateImage(prompt: string): Promise<GeneratedImage> {
         parts: [{ text: prompt }],
       },
     ],
+    config: {
+      responseModalities: ["IMAGE"],
+    },
   });
   const img = extractImageFromResponse(response);
   if (!img) {
@@ -79,6 +82,9 @@ export async function editImage(
         ],
       },
     ],
+    config: {
+      responseModalities: ["IMAGE"],
+    },
   });
   const img = extractImageFromResponse(response);
   if (!img) {
