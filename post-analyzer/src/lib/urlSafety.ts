@@ -1,5 +1,6 @@
 import { promises as dns, LookupAddress } from "node:dns";
 import net from "node:net";
+import { Agent } from "undici";
 
 const BLOCKED_HOSTS = new Set([
   "metadata.google.internal",
@@ -42,7 +43,6 @@ function isPrivateIPv6(ip: string): boolean {
   if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA
   if (lower.startsWith("fe80:")) return true; // link-local
   if (lower.startsWith("ff")) return true; // multicast
-  // IPv4-mapped IPv6: ::ffff:a.b.c.d
   const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   if (mapped) return isPrivateIPv4(mapped[1]);
   return false;
@@ -52,10 +52,16 @@ function isPrivateAddress(ip: string): boolean {
   const family = net.isIP(ip);
   if (family === 4) return isPrivateIPv4(ip);
   if (family === 6) return isPrivateIPv6(ip);
-  return true; // unknown → treat as unsafe
+  return true;
 }
 
-export async function assertSafeUrl(rawUrl: string): Promise<URL> {
+export interface SafeUrl {
+  url: URL;
+  resolvedIp: string;
+  ipFamily: 4 | 6;
+}
+
+export async function assertSafeUrl(rawUrl: string): Promise<SafeUrl> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -75,15 +81,19 @@ export async function assertSafeUrl(rawUrl: string): Promise<URL> {
     throw new Error("This host is not allowed.");
   }
 
-  // If the host is already a literal IP, check it directly.
+  // Literal IP: validate directly.
   if (net.isIP(hostname)) {
     if (isPrivateAddress(hostname)) {
       throw new Error("URLs pointing at private/internal IPs are not allowed.");
     }
-    return parsed;
+    return {
+      url: parsed,
+      resolvedIp: hostname,
+      ipFamily: net.isIP(hostname) === 6 ? 6 : 4,
+    };
   }
 
-  // Otherwise, resolve DNS and ensure no resolved address is private.
+  // Resolve DNS once and validate every answer.
   let records: LookupAddress[];
   try {
     records = await dns.lookup(hostname, { all: true, verbatim: true });
@@ -103,5 +113,26 @@ export async function assertSafeUrl(rawUrl: string): Promise<URL> {
     }
   }
 
-  return parsed;
+  const chosen = records[0];
+  return {
+    url: parsed,
+    resolvedIp: chosen.address,
+    ipFamily: chosen.family === 6 ? 6 : 4,
+  };
+}
+
+/**
+ * Returns an undici Agent that pins DNS resolution to the validated IP.
+ * This prevents DNS-rebinding TOCTOU between the SSRF check and fetch().
+ * Disables redirect-following at the network level so the caller can
+ * re-validate each hop explicitly.
+ */
+export function pinnedAgent(safe: SafeUrl): Agent {
+  return new Agent({
+    connect: {
+      lookup: (_hostname, _options, callback) => {
+        callback(null, safe.resolvedIp, safe.ipFamily);
+      },
+    },
+  });
 }

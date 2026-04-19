@@ -1,8 +1,9 @@
 import { load } from "cheerio";
 import { YoutubeTranscript } from "youtube-transcript";
-import { assertSafeUrl } from "./urlSafety";
+import { assertSafeUrl, pinnedAgent, type SafeUrl } from "./urlSafety";
 
 const MAX_CHARS = 12_000;
+const MAX_REDIRECTS = 3;
 
 function truncate(text: string): string {
   if (text.length <= MAX_CHARS) return text;
@@ -35,58 +36,48 @@ export async function fetchYouTubeTranscript(url: string): Promise<string> {
   return truncate(joined);
 }
 
-export async function fetchPageText(url: string): Promise<string> {
-  const safeUrl = await assertSafeUrl(url);
-  const res = await fetch(safeUrl.toString(), {
+async function safeFetchOnce(safe: SafeUrl): Promise<Response> {
+  const agent = pinnedAgent(safe);
+  // `dispatcher` is an undici-specific option that Node's global `fetch`
+  // forwards through, pinning DNS to the pre-validated IP. It is not on the
+  // standard RequestInit type so we cast.
+  const init = {
     redirect: "manual",
     headers: {
       "User-Agent":
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 PostAnalyzerBot/1.0",
       Accept: "text/html,application/xhtml+xml",
     },
-  });
-
-  if (res.status >= 300 && res.status < 400) {
-    const location = res.headers.get("location");
-    if (!location) {
-      throw new Error(`Redirect without Location header (status ${res.status}).`);
-    }
-    // Validate redirect target the same way before following.
-    const next = new URL(location, safeUrl).toString();
-    return fetchPageTextFollow(next, 1);
+    dispatcher: agent,
+  } as unknown as RequestInit;
+  try {
+    return await fetch(safe.url.toString(), init);
+  } finally {
+    agent.close().catch(() => {});
   }
-
-  if (!res.ok) {
-    throw new Error(`Failed to fetch URL (status ${res.status}).`);
-  }
-  return extractPageText(await res.text());
 }
 
-async function fetchPageTextFollow(url: string, depth: number): Promise<string> {
-  if (depth > 3) {
-    throw new Error("Too many redirects.");
-  }
-  const safeUrl = await assertSafeUrl(url);
-  const res = await fetch(safeUrl.toString(), {
-    redirect: "manual",
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 PostAnalyzerBot/1.0",
-      Accept: "text/html,application/xhtml+xml",
-    },
-  });
-  if (res.status >= 300 && res.status < 400) {
-    const location = res.headers.get("location");
-    if (!location) {
-      throw new Error(`Redirect without Location header (status ${res.status}).`);
+export async function fetchPageText(url: string): Promise<string> {
+  let safe = await assertSafeUrl(url);
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const res = await safeFetchOnce(safe);
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) {
+        throw new Error(
+          `Redirect without Location header (status ${res.status}).`,
+        );
+      }
+      const next = new URL(location, safe.url).toString();
+      safe = await assertSafeUrl(next);
+      continue;
     }
-    const next = new URL(location, safeUrl).toString();
-    return fetchPageTextFollow(next, depth + 1);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch URL (status ${res.status}).`);
+    }
+    return extractPageText(await res.text());
   }
-  if (!res.ok) {
-    throw new Error(`Failed to fetch URL (status ${res.status}).`);
-  }
-  return extractPageText(await res.text());
+  throw new Error("Too many redirects.");
 }
 
 function extractPageText(html: string): string {
@@ -95,7 +86,9 @@ function extractPageText(html: string): string {
   $("script, style, noscript, iframe, svg, nav, footer, header, aside").remove();
 
   const title = ($("title").first().text() || "").trim();
-  const metaDescription = ($('meta[name="description"]').attr("content") || "").trim();
+  const metaDescription = (
+    $('meta[name="description"]').attr("content") || ""
+  ).trim();
 
   const article = $("article").first();
   const bodyText = (article.length ? article.text() : $("body").text())
@@ -121,8 +114,7 @@ export async function fetchSourceFromUrl(url: string): Promise<{
   kind: "youtube" | "webpage";
 }> {
   if (isYouTubeUrl(url)) {
-    // `youtube-transcript` only hits youtube.com; no SSRF risk here because
-    // we've already confirmed the URL's host is a real YouTube domain.
+    // `youtube-transcript` only hits youtube.com; host check above confirms that.
     const text = await fetchYouTubeTranscript(url);
     return { text, kind: "youtube" };
   }
